@@ -1,72 +1,83 @@
 import os
 import subprocess
 import json
-import requests # For making HTTP requests to Gemini API
-import base64 # For handling base64 encoding/decoding
-import time # For potential delays
+import requests
+import base64
+import time
+import threading
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLineEdit, QPushButton, QTextEdit, QLabel, QMessageBox, QSizePolicy
+)
+from PyQt5.QtGui import QPixmap, QImage, QColor, QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
+from PIL import Image, ImageQt # Import Pillow for image handling
 
 # --- Gemini API Configuration ---
-# IMPORTANT: In a real application, you would load this from environment variables
-# or a secure configuration system. For this example, it's left as an empty string.
-# The Canvas environment will automatically provide the API key for gemini-2.0-flash.
-API_KEY = "AIzaSyC0iXmXyUU_rMXFLCF8T63_mUDIgzCl8Io" # Leave this as an empty string. Canvas will inject the key.
+# IMPORTANT: When running LOCALLY, you MUST replace the empty string below
+# with your actual Gemini API Key. Get it from Google AI Studio.
+# Example: API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+API_KEY = "AIzaSyC0iXmXyUU_rMXFLCF8T63_mUDIgzCl8Io"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-def get_adb_commands_from_gemini(prompt_text: str, base64_image_data: str = None) -> str:
+# --- Core Logic Functions (remain largely the same) ---
+
+def get_adb_commands_from_gemini(overall_task: str, base64_image_data: str = None) -> dict:
     """
-    Sends a natural language prompt (and optionally image data) to the Gemini API
-    and requests ADB commands.
+    Sends the overall task and optional image data to the Gemini API,
+    requesting a structured JSON response with the next ADB command and task status.
 
     Args:
-        prompt_text: The natural language command from the user.
+        overall_task: The high-level task the user wants to accomplish.
         base64_image_data: Optional base64 encoded string of a screenshot.
 
     Returns:
-        A string containing the generated ADB commands, or an error message.
+        A dictionary containing the generated command, status ('continue'/'done'),
+        and a reason, or an error dictionary.
     """
-    # System instruction to guide Gemini's response
-    # This instruction is crucial for Gemini to understand the desired output format.
     system_instruction = (
-        "You are an assistant that translates natural language commands into Android Debug Bridge (ADB) shell commands. "
-        "Provide only the ADB command(s) as output, one command per line. "
-        "Do not include any explanations, greetings, or extra text. "
-        "If a command requires text input, use `input text 'your text'` (e.g., `input text 'hello world'`). "
-        "For opening specific applications, use `am start -n package.name/activity.name`. "
-        "For opening web URLs, use `am start -a android.intent.action.VIEW -d http://example.com`. "
-        "For simulating key presses, use `input keyevent KEYCODE_EVENT` (e.g., `input keyevent KEYCODE_HOME`). "
-        "For tapping at screen coordinates, use `input tap X Y`. "
-        "For swiping, use `input swipe X1 Y1 X2 Y2 [duration_ms]`. "
-        "Assume the user's intent is to control the Android device via ADB. "
-        "If an image is provided, use it to understand the current screen context and generate more accurate commands. "
-        "For example, if the image shows a button, and the user says 'tap that button', you might infer its coordinates "
-        "or suggest a way to navigate to it if direct tapping isn't feasible. "
-        "Prioritize commands that directly interact with visible elements if the image provides enough context."
+        "You are an intelligent Android automation assistant. Your goal is to break down a user's overall task "
+        "into a sequence of single ADB commands. After each command, you will be provided with a new screenshot. "
+        "Based on the current screenshot and the overall task, determine the *next single logical ADB command* "
+        "to move closer to completing the task. "
+        "You must respond with a JSON object containing the following keys: "
+        "`command` (string): The single ADB command to execute (e.g., `input tap 100 200`, `am start -a android.intent.action.VIEW -d http://example.com`). "
+        "`status` (string): 'continue' if more steps are needed to complete the overall task, or 'done' if the task is complete. "
+        "`reason` (string): A brief explanation for the chosen command or why the task is considered done. "
+        "Do not include any other text outside the JSON object. "
+        "If the task is already complete based on the provided screenshot, set `status` to 'done' and provide a `reason`. "
+        "If you need to type text, use `input text 'your text'`. For tapping, use `input tap X Y`. For scrolling, use `input swipe X1 Y1 X2 Y2 [duration_ms]`."
         "\n\n"
-        "Here are some examples of expected outputs:\n"
-        "User: 'Open settings'\n"
-        "Output: `am start -n com.android.settings/.Settings`\n"
-        "User: 'Go to google.com'\n"
-        "Output: `am start -a android.intent.action.VIEW -d https://google.com`\n"
-        "User: 'Type hello world into the current field'\n"
-        "Output: `input text 'hello world'`\n"
-        "User: 'Tap at coordinates 100, 200'\n"
-        "Output: `input tap 100 200`\n"
-        "User: 'Press the home button'\n"
-        "Output: `input keyevent KEYCODE_HOME`\n"
-        "User: 'Scroll down'\n"
-        "Output: `input swipe 500 1500 500 500`\n" # Example swipe down
-        "User: 'Take a screenshot'\n"
-        "Output: `screencap -p /sdcard/screenshot.png`\n`pull /sdcard/screenshot.png`" # Example for multiple commands
+        "Specific instructions for navigation and app interaction:\n"
+        "- To reach control center, swipe down, then at notification center, swipe down again.\n"
+        "- If a command isn't seen, swipe to the left until you see it.\n"
+        "- If Gmail is opened and there is a current email opened, click the arrow in the corner (assume coordinates if needed).\n"
+        "- Stop if you have done more than 5 steps for a sub-task, and report 'done' for that sub-task.\n"
+        "\n"
+        "Example JSON output for continuing:\n"
+        "```json\n"
+        "{\n"
+        "  \"command\": \"am start -n com.android.settings/.Settings\",\n"
+        "  \"status\": \"continue\",\n"
+        "  \"reason\": \"Opening Android settings to begin configuration.\"\n"
+        "}\n"
+        "```\n"
+        "Example JSON output for task completion:\n"
+        "```json\n"
+        "{\n"
+        "  \"command\": \"echo 'Task complete'\",\n"
+        "  \"status\": \"done\",\n"
+        "  \"reason\": \"Successfully navigated to the target page.\"\n"
+        "}\n"
+        "```"
     )
 
-    # Build the parts for the content payload
-    content_parts = [{ "text": system_instruction + "\n" + prompt_text }]
+    content_parts = [{"text": system_instruction + "\nOverall Task: " + overall_task}]
 
-    # If image data is provided, add it to the content parts
     if base64_image_data:
         content_parts.append({
             "inlineData": {
-                "mimeType": "image/png", # Assuming PNG format for screenshots
+                "mimeType": "image/png",
                 "data": base64_image_data
             }
         })
@@ -76,9 +87,19 @@ def get_adb_commands_from_gemini(prompt_text: str, base64_image_data: str = None
             {"role": "user", "parts": content_parts}
         ],
         "generationConfig": {
-            "temperature": 0.1, # Keep temperature low for more deterministic and precise output
+            "temperature": 0.1,
             "topK": 1,
             "topP": 1,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "command": {"type": "STRING"},
+                    "status": {"type": "STRING", "enum": ["continue", "done"]},
+                    "reason": {"type": "STRING"}
+                },
+                "required": ["command", "status", "reason"]
+            }
         }
     }
 
@@ -86,116 +107,441 @@ def get_adb_commands_from_gemini(prompt_text: str, base64_image_data: str = None
         'Content-Type': 'application/json'
     }
 
-    # Construct the API URL with the API key. Canvas will inject the key at runtime.
     api_url_with_key = f"{GEMINI_API_URL}?key={API_KEY}"
 
     try:
-        # Make the POST request to the Gemini API
         response = requests.post(api_url_with_key, headers=headers, data=json.dumps(payload))
-        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         result = response.json()
 
-        # Extract the generated text from the API response
         if result.get("candidates") and result["candidates"][0].get("content") and result["candidates"][0]["content"].get("parts"):
-            generated_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return generated_text
+            json_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if json_text.startswith("```json") and json_text.endswith("```"):
+                json_text = json_text[len("```json"): -len("```")].strip()
+            
+            try:
+                return json.loads(json_text)
+            except json.JSONDecodeError:
+                return {"error": f"Gemini returned invalid JSON: {json_text}", "raw_response": json.dumps(result, indent=2)}
         else:
-            # Handle cases where the response structure is unexpected or content is missing
-            return f"Error: No content generated by Gemini. Response: {json.dumps(result, indent=2)}"
+            return {"error": "No content generated by Gemini. Check API response structure.", "response": json.dumps(result, indent=2)}
     except requests.exceptions.RequestException as e:
-        # Catch network-related errors or bad HTTP responses
-        return f"Error communicating with Gemini API: {e}"
-    except json.JSONDecodeError:
-        # Catch errors if the response is not valid JSON
-        return f"Error decoding JSON response from Gemini: {response.text}"
+        return {"error": f"Error communicating with Gemini API: {e}"}
     except Exception as e:
-        # Catch any other unexpected errors
-        return f"An unexpected error occurred: {e}"
+        return {"error": f"An unexpected error occurred: {e}"}
 
-def main():
+def capture_and_encode_screenshot(filename="current_screenshot.png", log_callback=None, image_display_callback=None) -> str | None:
     """
-    Main function to run the AI-powered Android Controller script.
-    It prompts the user for commands, gets ADB commands from Gemini, and prints them.
+    Captures a screenshot from the Android device using ADB and encodes it to base64.
+    Also updates the GUI with the captured image.
+    This function is designed to be run on a LOCAL machine with ADB installed.
     """
-    print("Welcome to the AI-powered Android Controller!")
-    print("This script generates ADB commands based on your natural language prompts using the Gemini API.")
-    print("\nIMPORTANT NOTE:")
-    print("This script is designed to run on your LOCAL machine, where ADB is installed and your Android device is connected.")
-    print("The screenshot capture and transfer steps MUST be executed locally.")
-    print("The generated commands will be printed for you to execute manually in your local terminal.")
-    print("Type 'exit' to quit.")
-    print("\nExample prompts:")
-    print("- 'Open Chrome and go to https://www.google.com'")
-    print("- 'Type hello world into the current input field'")
-    print("- 'Tap the screen at coordinates 500, 1200'")
-    print("- 'Press the back button'")
-    print("- 'Scroll down the current page'")
-    print("\n--- Screenshot Integration (Local Execution Required) ---")
-    print("Before each command, the script will attempt to get a screenshot from your device.")
-    print("This requires ADB setup and permissions on your local machine.")
+    if log_callback:
+        log_callback(f"\nAttempting to capture and pull '{filename}' from device via ADB...")
+    try:
+        subprocess.run(
+            ["adb", "shell", "screencap", "-p", f"/sdcard/{filename}"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        if log_callback:
+            log_callback(f"Screenshot captured on device: /sdcard/{filename}")
+        time.sleep(1)
 
-    while True:
-        current_screenshot_base64 = None
-        screenshot_filename = "current_screenshot.png" # Temporary file for screenshot
+        subprocess.run(
+            ["adb", "pull", f"/sdcard/{filename}", "."],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        if log_callback:
+            log_callback(f"Screenshot pulled to local directory: {filename}")
 
-        print("\nAttempting to capture screenshot from device via ADB...")
-        print("--- Local ADB Commands to Execute ---")
-        print(f"1. `adb shell screencap -p /sdcard/{screenshot_filename}`")
-        print(f"2. `adb pull /sdcard/{screenshot_filename} .`")
-        print("-------------------------------------")
-        print("Please execute these two commands in your LOCAL terminal.")
-        print("Press Enter after you have pulled the screenshot to continue.")
-        input() # Wait for user to confirm screenshot is pulled
+        with open(filename, 'rb') as f:
+            image_data = f.read()
+            encoded_string = base64.b64encode(image_data).decode('utf-8')
+        if log_callback:
+            log_callback(f"Screenshot encoded to base64.")
 
-        # --- THIS SECTION SIMULATES LOCAL SCREENSHOT CAPTURE AND BASE64 ENCODING ---
-        # In a real local application, you would replace the following lines
-        # with actual subprocess calls and file operations.
-        print(f"Assuming '{screenshot_filename}' is now in your current directory.")
+        if image_display_callback:
+            try:
+                image = Image.open(filename)
+                # Resize image to fit in the GUI, maintaining aspect ratio
+                max_width = 300
+                max_height = 400
+                image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+                image_display_callback(ImageQt.toqpixmap(image)) # Changed to emit QPixmap directly
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"Error displaying image in GUI: {e}")
+
         try:
-            # Simulate reading a local file. In a real scenario, you'd read the actual file.
-            # For this environment, we'll ask the user to paste it if they want to test.
-            print("To proceed with image analysis, you MUST paste the base64 string of your screenshot.")
-            print("Use this Python command in your LOCAL terminal to get the base64 string:")
-            print(f"`import base64; with open('{screenshot_filename}', 'rb') as f: print(base64.b64encode(f.read()).decode('utf-8'))`")
-            current_screenshot_base64 = input("Paste Base64 encoded image data here (or leave empty to skip image context for this command):\n> ").strip()
-            if not current_screenshot_base64:
-                print("No screenshot provided for AI context.")
-        except FileNotFoundError:
-            print(f"Error: Could not find '{screenshot_filename}'. Make sure you pulled it successfully.")
-        except Exception as e:
-            print(f"An error occurred during local screenshot processing simulation: {e}")
-        # --- END OF LOCAL SIMULATION SECTION ---
+            os.remove(filename)
+            if log_callback:
+                log_callback(f"Cleaned up local file: {filename}")
+        except OSError as e:
+            if log_callback:
+                log_callback(f"Error removing local screenshot file {filename}: {e}")
 
-        user_prompt = input("\nEnter your command for the Android phone:\n> ").strip()
+        return encoded_string
 
-        if user_prompt.lower() == 'exit':
-            print("Exiting application. Goodbye!")
-            break
+    except subprocess.CalledProcessError as e:
+        error_msg = (
+            f"Error executing ADB command: {e.cmd}\n"
+            f"Stdout: {e.stdout.strip()}\n"
+            f"Stderr: {e.stderr.strip()}\n"
+            "Please ensure ADB is installed, your device is connected, and USB debugging is enabled."
+        )
+        if log_callback:
+            log_callback(error_msg)
+        return None
+    except FileNotFoundError:
+        error_msg = "Error: ADB command not found. Is ADB installed and in your system's PATH?"
+        if log_callback:
+            log_callback(error_msg)
+        return None
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during screenshot capture/encoding: {e}"
+        if log_callback:
+            log_callback(error_msg)
+        return None
 
-        print("\nThinking... (Generating ADB commands with Gemini AI)")
-        # Call Gemini to get the ADB commands, passing the screenshot if available
-        adb_commands_raw = get_adb_commands_from_gemini(user_prompt, current_screenshot_base64)
+def execute_adb_command(command: str, log_callback=None) -> bool:
+    """
+    Executes a single ADB command using subprocess.
+    Determines if it's an 'adb shell' command or a direct 'adb' command.
+    """
+    command_parts = command.strip().split(maxsplit=1)
 
-        if adb_commands_raw.startswith("Error:"):
-            print(adb_commands_raw) # Print any errors from Gemini API call
-            continue
+    if not command_parts:
+        return False
 
-        print("\n--- Generated ADB Commands ---")
-        print("Please execute these commands in your local terminal:")
-        print("------------------------------")
-        # Split the generated commands by newline, as Gemini might return multiple commands
-        commands_to_execute = adb_commands_raw.split('\n')
-        for cmd in commands_to_execute:
-            if cmd.strip(): # Ensure the command is not empty after stripping whitespace
-                print(f"'{cmd.strip()}'") # Print each generated command
+    if command_parts[0] in ["screencap", "pull", "install", "push", "devices", "logcat"]:
+        full_cmd = ["adb"] + command.strip().split()
+    else:
+        full_cmd = ["adb", "shell"] + command.strip().split()
 
-        print("------------------------------")
-        print("\nTo run these, open your terminal and type 'adb shell <command>' for most commands.")
-        print("For commands like 'pull' or 'install', just use 'adb <command>'.")
-        print("For example, if the generated command is 'am start -n com.android.chrome/com.google.android.apps.chrome.Main',")
-        print("you would type in your terminal: 'adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main'")
-        print("Make sure your device is connected and recognized by ADB (run 'adb devices' to check).")
+    if log_callback:
+        log_callback(f"Executing: {' '.join(full_cmd)}")
+    try:
+        result = subprocess.run(
+            full_cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        if log_callback:
+            log_callback(f"Command output: {result.stdout.strip()}")
+            if result.stderr:
+                log_callback(f"Command error: {result.stderr.strip()}")
+        return True
+    except subprocess.CalledProcessError as e:
+        error_msg = (
+            f"Error executing command '{' '.join(full_cmd)}':\n"
+            f"  Return Code: {e.returncode}\n"
+            f"  Stdout: {e.stdout.strip()}\n"
+            f"  Stderr: {e.stderr.strip()}"
+        )
+        if log_callback:
+            log_callback(error_msg)
+        return False
+    except FileNotFoundError:
+        error_msg = "Error: 'adb' command not found. Ensure ADB is installed and in your system's PATH."
+        if log_callback:
+            log_callback(error_msg)
+        return False
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during command execution: {e}"
+        if log_callback:
+            log_callback(error_msg)
+        return False
 
-# This ensures that main() is called only when the script is executed directly
+# --- Worker Thread for Automation ---
+class AutomationWorker(QObject):
+    # Signals to update the GUI from the worker thread
+    log_message_signal = pyqtSignal(str)
+    update_screenshot_signal = pyqtSignal(QPixmap) # Changed to QPixmap
+    automation_finished_signal = pyqtSignal()
+    show_error_signal = pyqtSignal(str, str)
+
+    def __init__(self, overall_task):
+        super().__init__()
+        self.overall_task = overall_task
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        max_steps = 20
+        current_step = 0
+        try:
+            while self._is_running and current_step < max_steps:
+                current_step += 1
+                self.log_message_signal.emit(f"\n--- Step {current_step} ---")
+
+                # Step 1: Capture screenshot and encode it for Gemini
+                current_screenshot_base64 = capture_and_encode_screenshot(
+                    log_callback=self.log_message_signal.emit,
+                    image_display_callback=self.update_screenshot_signal.emit # Now emits QPixmap directly
+                )
+
+                if not self._is_running:
+                    self.log_message_signal.emit("Automation stopped during screenshot capture.")
+                    break
+
+                if current_screenshot_base64 is None:
+                    self.log_message_signal.emit("Failed to get screenshot. Cannot proceed with AI context for this command.")
+                    self.log_message_signal.emit("Please resolve the screenshot issue (check ADB, device connection, USB debugging).")
+                    self.show_error_signal.emit("Automation Error", "Failed to get screenshot. Check ADB setup and device connection.")
+                    self._is_running = False
+                    break
+
+                self.log_message_signal.emit("Thinking... (AI analyzing screen and determining next action)")
+                # Step 2: Call Gemini to get the next ADB command and task status
+                gemini_response = get_adb_commands_from_gemini(self.overall_task, current_screenshot_base64)
+
+                if not self._is_running:
+                    self.log_message_signal.emit("Automation stopped during Gemini API call.")
+                    break
+
+                if "error" in gemini_response:
+                    error_detail = gemini_response.get('error', 'Unknown API Error')
+                    self.log_message_signal.emit(f"Error from Gemini API: {error_detail}")
+                    self.log_message_signal.emit("Please check your API key, network connection, or Gemini API response structure.")
+                    self.show_error_signal.emit("Automation Error", f"Gemini API Error: {error_detail}")
+                    self._is_running = False
+                    break
+
+                command_to_execute = gemini_response.get("command")
+                task_status = gemini_response.get("status")
+                reason = gemini_response.get("reason", "No reason provided.")
+
+                self.log_message_signal.emit(f"AI's Reason: {reason}")
+                self.log_message_signal.emit(f"AI's Status: {task_status}")
+
+                if not command_to_execute:
+                    self.log_message_signal.emit("Gemini did not provide a command. This might indicate an issue or task completion.")
+                    if task_status == "done":
+                        self.log_message_signal.emit("Task reported as done by AI, but no final command. Ending task.")
+                    else:
+                        self.log_message_signal.emit("No command, but task not done. Ending due to potential issue.")
+                    self._is_running = False
+                    break
+
+                self.log_message_signal.emit(f"Generated command: '{command_to_execute}'")
+                # Step 3: Execute the generated ADB command
+                success = execute_adb_command(command_to_execute, log_callback=self.log_message_signal.emit)
+
+                if not self._is_running:
+                    self.log_message_signal.emit("Automation stopped during command execution.")
+                    break
+
+                if not success:
+                    self.log_message_signal.emit(f"Failed to execute command: '{command_to_execute}'")
+                    self.log_message_signal.emit("AI might be stuck or generated an incorrect command. Ending task.")
+                    self.show_error_signal.emit("Automation Error", f"Failed to execute ADB command: '{command_to_execute}'")
+                    self._is_running = False
+                    break
+
+                time.sleep(2) # Give the device time to process the command and update screen
+
+                # Step 4: Check if the task is done
+                if task_status == "done":
+                    self.log_message_signal.emit(f"\n--- Task Completed ---")
+                    self.log_message_signal.emit(f"AI reported task '{self.overall_task}' as done. Reason: {reason}")
+                    self._is_running = False
+                    break
+
+            if self._is_running: # If loop finished because max_steps was reached
+                self.log_message_signal.emit(f"\n--- Task Limit Reached ---")
+                self.log_message_signal.emit(f"Task '{self.overall_task}' did not complete within {max_steps} steps.")
+                self.log_message_signal.emit("The AI might be stuck or unable to complete the task. Please review the last steps.")
+                self._is_running = False
+
+        finally:
+            self.automation_finished_signal.emit()
+            self.log_message_signal.emit("\nAutomation session ended.")
+
+
+class AndroidAutomationApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI Android Automation")
+        self.setGeometry(100, 100, 500, 800) # Increased height for screenshot
+        self.setStyleSheet("background-color: white;")
+
+        self.running_task = False
+        self.automation_thread = None
+        self.worker = None
+        self.current_screenshot_pixmap = None # To hold the QPixmap reference
+
+        self._placeholder_text = "Enter command"
+
+        self.init_ui()
+        self.display_initial_instructions()
+
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(30, 30, 30, 30) # Add margin to the main layout
+        main_layout.setSpacing(15) # Spacing between widgets
+
+        # Task Entry (QLineEdit)
+        self.task_entry = QLineEdit(self)
+        self.task_entry.setFont(QFont("Arial", 16, QFont.Bold))
+        self.task_entry.setStyleSheet(
+            "background-color: #64B446; color: white; border: none; "
+            "padding: 15px 20px; border-radius: 25px;" # Rounded corners, padding
+        )
+        self.task_entry.setAlignment(Qt.AlignCenter)
+        self.task_entry.setText(self._placeholder_text)
+        self.task_entry.setPlaceholderText(self._placeholder_text) # For visual consistency
+        self.task_entry.textChanged.connect(self._handle_text_change) # Connect text change signal
+        main_layout.addWidget(self.task_entry, alignment=Qt.AlignCenter)
+
+        # Do Button (QPushButton)
+        self.start_button = QPushButton("Do", self)
+        self.start_button.setFont(QFont("Arial", 14, QFont.Bold))
+        self.start_button.setStyleSheet(
+            "background-color: #64B446; color: white; border: none; "
+            "padding: 10px 30px; border-radius: 20px;" # Rounded corners, padding
+        )
+        self.start_button.setFixedSize(120, 50) # Fixed size for the button
+        self.start_button.clicked.connect(self.start_automation)
+        main_layout.addWidget(self.start_button, alignment=Qt.AlignCenter)
+
+        # Stop Button (QPushButton) - Added back for control
+        self.stop_button = QPushButton("Stop", self)
+        self.stop_button.setFont(QFont("Arial", 12))
+        self.stop_button.setStyleSheet(
+            "background-color: #FF6347; color: white; border: none; "
+            "padding: 5px 15px; border-radius: 15px;"
+        )
+        self.stop_button.clicked.connect(self.stop_automation)
+        self.stop_button.setEnabled(False) # Initially disabled
+        main_layout.addWidget(self.stop_button, alignment=Qt.AlignCenter)
+
+        # Screenshot Display Area (QLabel)
+        self.screenshot_label = QLabel(self)
+        self.screenshot_label.setAlignment(Qt.AlignCenter)
+        self.screenshot_label.setStyleSheet("background-color: lightgray; border: 1px solid #ccc; border-radius: 15px;")
+        self.screenshot_label.setFixedSize(300, 400) # Fixed size for consistency with previous Tkinter
+        main_layout.addWidget(self.screenshot_label, alignment=Qt.AlignCenter)
+
+        # Logs area (QTextEdit)
+        self.log_area = QTextEdit(self)
+        self.log_area.setReadOnly(True)
+        self.log_area.setFont(QFont("Arial", 10))
+        self.log_area.setStyleSheet(
+            "background-color: #B4DC9F; color: black; border: none; "
+            "padding: 20px; border-radius: 25px;" # Rounded corners, padding
+        )
+        self.log_area.setText("Logs go here")
+        # Set size policy to expand and fill available space
+        self.log_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        main_layout.addWidget(self.log_area)
+
+    def _handle_text_change(self, text):
+        """Handles text changes in the QLineEdit for placeholder behavior."""
+        if text == self._placeholder_text:
+            self.task_entry.setStyleSheet(
+                "background-color: #64B446; color: white; border: none; "
+                "padding: 15px 20px; border-radius: 25px;"
+            )
+        else:
+            self.task_entry.setStyleSheet(
+                "background-color: #64B446; color: black; border: none; "
+                "padding: 15px 20px; border-radius: 25px;"
+            )
+
+    def display_initial_instructions(self):
+        """Displays initial setup instructions in the log area."""
+        self.log_message("\nWelcome to the AI-powered Android Controller GUI!")
+        self.log_message("IMPORTANT PREREQUISITES:")
+        self.log_message("1. ADB (Android Debug Bridge) must be installed on your system and in your PATH.")
+        self.log_message("2. Your Android device must be connected via USB.")
+        self.log_message("3. USB Debugging must be enabled in your device's Developer Options.")
+        self.log_message("4. You may need to authorize your computer on your phone the first time you connect.")
+        self.log_message("5. Install PyQt5 and Pillow: pip install PyQt5 Pillow")
+        self.log_message("\nRemember to set your Gemini API Key in the script's API_KEY variable!")
+        self.log_message("\nEnter your overall task above and click 'Do'.")
+
+    def log_message(self, message):
+        """Appends a message to the scrolled text area."""
+        # Use append to add text and automatically scroll to end
+        # Ensure this is called on the main thread if from a worker thread
+        if self.log_area.toPlainText().strip() == "Logs go here":
+            self.log_area.clear()
+        self.log_area.append(message)
+
+    def update_screenshot_display(self, qpixmap):
+        """Updates the QLabel with the given QPixmap."""
+        self.current_screenshot_pixmap = qpixmap # Store reference to prevent garbage collection
+        self.screenshot_label.setPixmap(self.current_screenshot_pixmap.scaled(
+            self.screenshot_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ))
+
+    def start_automation(self):
+        """Initiates the automation process."""
+        if self.running_task:
+            return
+
+        if not API_KEY: # Check for API Key
+            QMessageBox.critical(self, "API Key Missing", "Please set your Gemini API Key in the script's API_KEY variable before running.")
+            self.log_message("ERROR: Gemini API Key is missing. Please update the API_KEY variable in the script.")
+            return
+
+        overall_task = self.task_entry.text().strip()
+        if not overall_task or overall_task == self._placeholder_text:
+            QMessageBox.warning(self, "Input Error", "Please enter an overall task.")
+            return
+
+        self.running_task = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.log_area.clear() # Clear previous logs
+        self.log_message(f"\nStarting task: '{overall_task}'")
+        self.log_message("The AI will now attempt to complete this task step-by-step.")
+
+        # Create a QThread and Worker to run automation in background
+        self.automation_thread = QThread()
+        self.worker = AutomationWorker(overall_task)
+        self.worker.moveToThread(self.automation_thread)
+
+        # Connect signals from worker to GUI slots
+        self.worker.log_message_signal.connect(self.log_message)
+        self.worker.update_screenshot_signal.connect(self.update_screenshot_display)
+        self.worker.automation_finished_signal.connect(self._automation_finished)
+        self.worker.show_error_signal.connect(lambda title, msg: QMessageBox.critical(self, title, msg))
+
+
+        # Connect thread started/finished signals
+        self.automation_thread.started.connect(self.worker.run)
+        self.automation_thread.finished.connect(self.automation_thread.deleteLater) # Clean up thread
+
+        # Start the thread
+        self.automation_thread.start()
+
+    def stop_automation(self):
+        """Requests the automation worker to stop."""
+        if self.worker:
+            self.worker.stop()
+        self.log_message("Stopping automation requested by user...")
+        # Button states will be reset by _automation_finished
+
+    def _automation_finished(self):
+        """Slot connected to worker's automation_finished_signal."""
+        self.running_task = False
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        # The log_message about session ending is already handled by the worker's finally block
+
+
 if __name__ == "__main__":
-    main()
+    app = QApplication([])
+    window = AndroidAutomationApp()
+    window.show()
+    app.exec_()
